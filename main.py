@@ -60,6 +60,9 @@ WINDOW_AFTER_MIN = env("WINDOW_AFTER_MIN", 60, int)     # "under 1 hour" rule
 MIN_SIMILARITY = env("MIN_SIMILARITY", 0.6, float)
 BOT_REPLY_TIMEOUT = env("BOT_REPLY_TIMEOUT", 120, int)
 DRY_RUN = env("DRY_RUN", False, bool)                   # true = never post in main group
+ASK_APPROVAL = env("ASK_APPROVAL", True, bool)          # ask you in Saved Messages before posting
+APPROVAL_WAIT_MIN = env("APPROVAL_WAIT_MIN", 15, float) # no answer in this time = skip
+approvals = {}  # msg_id -> asyncio.Future
 NOTIFY_SUCCESS = env("NOTIFY_SUCCESS", True, bool)
 STATE_FILE = env("STATE_FILE", "/data/state.json" if os.path.isdir("/data") else "state.json")
 
@@ -395,6 +398,21 @@ async def run_attempt(job):
                 return await finish(job, True, f"already sent from main group by {who} – I didn't send again")
             if DRY_RUN:
                 return await finish(job, True, f"DRY RUN: would send '{cmd}' in main group now")
+            if ASK_APPROVAL:
+                fut = asyncio.get_event_loop().create_future()
+                approvals[job["msg_id"]] = fut
+                await notify(f"❓ Plan {plan['key']} deal #{job['msg_id']} passed the test search.\n"
+                             f"Send it to main group + WhatsApp with:  {cmd}\n\n"
+                             f"Reply here:  /deal ok {job['msg_id']}   or   /deal no {job['msg_id']}\n"
+                             f"(no answer in {APPROVAL_WAIT_MIN:g} min = skipped)\n\n"
+                             + job["text"] + "\n\n" + "\n".join(rep))
+                try:
+                    yes = await asyncio.wait_for(fut, APPROVAL_WAIT_MIN * 60)
+                except asyncio.TimeoutError:
+                    yes = None
+                approvals.pop(job["msg_id"], None)
+                if not yes:
+                    return await finish(job, False, "skipped – " + ("you said no" if yes is False else "no approval reply"))
             _, res2 = await search(main_entity, cmd, in_group=True)
             ok2, rep2 = await verify(job, plan, res2)
             job["log"].append("Main group check:\n  " + "\n  ".join(rep2))
@@ -449,7 +467,7 @@ async def scheduler():
 
 def status_text():
     act = [j for j in jobs.values() if j["status"] in ("pending", "running")]
-    lines = [f"🤖 Deal bot {'PAUSED' if paused else 'running'} | plans {','.join(PLANS)} | dry_run={DRY_RUN}"]
+    lines = [f"🤖 Deal bot {'PAUSED' if paused else 'running'} | plans {','.join(PLANS)} | dry_run={DRY_RUN} | ask_approval={ASK_APPROVAL}"]
     for j in sorted(act, key=lambda j: j["next_run"]):
         lines.append(f"• Plan {plans[j['chat']]['key']} #{j['msg_id']} try {j['attempt'] + 1} at "
                      f"{fmt(j['next_run'])}: {L.deal_title(j['text'])[:50]}")
@@ -490,6 +508,13 @@ async def main():
     async def on_cmd(event):
         global paused
         t = event.raw_text.lower()
+        m = re.search(r"\b(ok|yes|no|skip)\s+(\d+)", t)
+        if m and int(m.group(2)) in approvals:
+            fut = approvals[int(m.group(2))]
+            if not fut.done():
+                fut.set_result(m.group(1) in ("ok", "yes"))
+            await event.reply("👍 sending now" if m.group(1) in ("ok", "yes") else "⏭ skipped")
+            return
         if "pause" in t:
             paused = True
         elif "resume" in t:
