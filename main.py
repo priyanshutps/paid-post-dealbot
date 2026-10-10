@@ -272,7 +272,8 @@ async def handle_plan_msg(msg, chat_id, startup=False, edited=False):
 def _final(m):
     t = (m.message or "").lower()
     return bool(m.photo or "t.me/" in t or "not posted" in t or "not found" in t
-                or "no result" in t or "no post" in t or "no match" in t or "unauthori" in t)
+                or "no result" in t or "no post" in t or "no match" in t or "unauthori" in t
+                or "error" in t or "timed out" in t)
 
 
 search_lock = asyncio.Lock()
@@ -383,7 +384,7 @@ async def already_sent(job, plan, title_tokens):
         if m.date.astimezone(IST) < since:
             continue
         t = (m.message or "").strip()
-        if not t.lower().startswith(plan["cmd"] + " ") or m.out:
+        if not t.lower().startswith(plan["cmd"] + " "):  # includes our own earlier sends (restart safety)
             continue
         kw = set(L.tokens(t[len(plan["cmd"]):]))
         if not kw or not kw <= title:
@@ -393,7 +394,8 @@ async def already_sent(job, plan, title_tokens):
         for r in msgs:
             if r.reply_to_msg_id == m.id and "sent to" in (r.message or "").lower():
                 s = await m.get_sender()
-                return f"{getattr(s, 'first_name', None) or 'someone'} ('{t}' at {fmt(m.date)})"
+                who = "me (earlier run)" if m.out else (getattr(s, 'first_name', None) or 'someone')
+                return f"{who} ('{t}' at {fmt(m.date)})"
     return None
 
 
