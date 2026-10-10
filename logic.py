@@ -88,33 +88,44 @@ def deal_title(text):
 
 
 def _clean(s):
-    s = re.sub(r"[^\w\s&,()\-:+.'/%]", " ", s)  # drop emojis / odd symbols
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[^\w\s&,()\-:+.'’‘/%]", " ", s)  # drop emojis / odd symbols
+    s = re.sub(r"[ \t]*\n[ \t]*", " ", s).strip()  # keep inner spacing as written
     return s.strip(" :-|,.")
 
 
+def _meaningful(seg):
+    return [w for w in re.findall(r"[A-Za-z0-9’']+", seg)
+            if w.lower() not in STOP | WEAK and not re.fullmatch(r"\d+", w) and len(w) > 1]
+
+
 def keyword_levels(text):
-    """Three search phrases, longest first, like a human would try."""
+    """Three search phrases, longest first. Each is a continuous piece of the deal line,
+    so the screenshot bot (text search) can still match it."""
     title = deal_title(text)
-    l1 = _clean(title.split("@")[0])
-    if not l1:
-        l1 = _clean(title)
-    # level 2: drop a short 'GRAB :' style prefix, stop at first comma / bracket
+    l1 = _clean(title.split("@")[0]) or _clean(title)
+    # level 2: drop a short 'GRAB :' style prefix, then the comma/bracket part with most real words
     body = l1
     if ":" in body:
         pre, post = body.split(":", 1)
         if len(pre.split()) <= 2 and post.strip():
-            body = post
-    l2 = _clean(re.split(r"[,(\[|]", body)[0])
-    words = l2.split()
-    if l2 == l1 and len(words) > 4:
-        l2 = " ".join(words[:4])
-    # level 3: first two meaningful words
-    meaningful = [w for w in l2.split() if w.lower().strip(".,:") not in STOP | WEAK and len(w) > 1
-                  and not re.search(r"\d+%|^\d+$", w)]
-    l3 = " ".join(meaningful[:2]) if len(meaningful) >= 2 else l2
+            body = post.strip()
+    segs = [x.strip(" :-|,.&") for x in re.split(r"[,(\[|]", body) if x.strip(" :-|,.&")]
+    l2 = max(segs, key=lambda x: len(_meaningful(x))) if segs else body
+    if len(l2.split()) > 5:
+        l2 = " ".join(l2.split()[:5])
+    if l2 == l1 and len(l2.split()) > 3:
+        l2 = " ".join(l2.split()[:4])
+    # level 3: first two neighbouring real words of the product name (brand + word)
+    w = body.split()
+    l3 = l2
+    for i in range(len(w) - 1):
+        if _meaningful(w[i]) and _meaningful(w[i + 1]) and w[i] == w[i].strip(",.:()&") \
+                and w[i + 1].strip(",.:()&"):
+            l3 = w[i] + " " + w[i + 1].rstrip(",.:()&")
+            break
     levels = []
     for k in (l1, l2, l3):
+        k = k.strip(" :-|,.&")
         if k and k not in levels:
             levels.append(k)
     while len(levels) < 3:
@@ -201,3 +212,95 @@ def ocr_rows(image_path):
 
 def in_window(post_dt, sched, before_min=20, after_min=60):
     return sched - timedelta(minutes=before_min) <= post_dt <= sched + timedelta(minutes=after_min)
+
+
+# ------------------------------------------------------------------ multi-deal parsing
+INSTANT_RE = re.compile(r"\b(asap|dalo|daalo|dal\s*do|daal\s*do|post\s+now|abhi\s+post|instant(ly)?|immediately|right\s+now)\b", re.I)
+PRICE_RE = re.compile(r"@\s*₹?\s*(\d[\d,]*)")
+EMOJI_JUNK = re.compile(r"[^\w\s:.@&()\-+/%|'’‘]")
+
+
+def _time_in(line):
+    """(hour, minute, ampm) of the first time in a line, or None."""
+    clean = URL_RE.sub(" ", line)
+    for mt in TIME_RE.finditer(clean):
+        h, m, ampm = int(mt.group(1)), int(mt.group(2)), mt.group(3)
+        if h > 23 or m > 59:
+            continue
+        if PRICE_RE.search(clean[max(0, mt.start() - 3):mt.end()]):
+            continue  # "@1.99" is a price
+        return h, m, ampm, mt
+    return None
+
+
+def is_time_line(line):
+    """A line that only announces a time: 'Plan C - 10:35 PM @all', '9:07 PM (Same Time) ✅',
+    '9.15 @all', '8:10 PM With Image @all', 'Free Post - 9:55 PM @all'."""
+    if URL_RE.search(line) or PRICE_RE.search(line):
+        return False
+    t = _time_in(line)
+    if not t:
+        return False
+    rest = EMOJI_JUNK.sub(" ", line[:t[3].start()] + " " + line[t[3].end():])
+    words = [w for w in re.findall(r"[A-Za-z]+", rest)
+             if w.lower() not in {"plan", "a", "b", "c", "all", "pm", "am", "same", "time", "with", "image",
+                                  "free", "post", "at", "on", "deal", "deals", "new", "updated", "change", "changed"}]
+    return len(words) <= 2
+
+
+def is_instant_line(line):
+    if URL_RE.search(line) or PRICE_RE.search(line):
+        return False
+    return bool(INSTANT_RE.search(line)) and len(line.split()) <= 6
+
+
+def _resolve(h, m, ampm, msg_dt):
+    cands = [c for c in _candidates(h, m, ampm, msg_dt) if c >= msg_dt - timedelta(minutes=30)]
+    return min(cands) if cands else None
+
+
+def parse_deals(text, msg_dt):
+    """Split one plan message into deals.
+    Returns [{'sched': datetime|None, 'instant': bool, 'text': str, 'title': str, 'price': str|None, 'label': str}]"""
+    lines = (text or "").splitlines()
+    segments, cur = [], {"time_line": None, "lines": []}
+    instant_all = any(is_instant_line(l) for l in lines[:3])
+    for l in lines:
+        s = l.strip()
+        if is_time_line(s):
+            if cur["lines"] and any(URL_RE.search(x) for x in cur["lines"]):
+                segments.append(cur)
+                cur = {"time_line": s, "lines": []}
+            else:
+                cur["time_line"] = s  # header time (or time just before its deal)
+            continue
+        cur["lines"].append(l)
+    segments.append(cur)
+    deals = []
+    for seg in segments:
+        body = "\n".join(seg["lines"]).strip()
+        if not URL_RE.search(body):
+            continue
+        sched, instant = None, False
+        if seg["time_line"]:
+            h, m, ap, _ = _time_in(seg["time_line"])
+            sched = _resolve(h, m, ap, msg_dt)
+        elif instant_all or any(is_instant_line(x) for x in seg["lines"][:3]):
+            sched, instant = msg_dt, True
+        seg_text = ((seg["time_line"] + "\n\n") if seg["time_line"] else "") + body
+        title = deal_title(body)
+        pm = PRICE_RE.search(title)
+        deals.append({"sched": sched, "instant": instant, "text": seg_text, "title": title,
+                      "price": pm.group(1).replace(",", "") if pm else None,
+                      "label": seg["time_line"] or ("ASAP" if instant else "no time")})
+    return deals
+
+
+def price_ok(price, text):
+    """False only when the text clearly shows a DIFFERENT @price."""
+    if not price:
+        return True
+    found = [p.replace(",", "") for p in PRICE_RE.findall(text or "")]
+    if not found:
+        return True
+    return price in found

@@ -8,7 +8,11 @@ Telethon userbot that automates the Plan C paid-post screenshot work:
 4. **Asks you first** in Saved Messages: reply `/deal ok <id>` to send or `/deal no <id>` to skip (no reply in 15 min = skipped). Turn off with `ASK_APPROVAL=false` once you trust it.
 5. If OK → sends the same `/c <keywords>` in **Paid Post Screenshot & Links**, checks again, presses **Send to Plan C Group (WhatsApp)**.
 6. If not OK → tries again after 5 min with shorter keywords (3 tries: full line → product name → 2 words). After 3 failures, sends the deal to **Saved Messages** with "Not posted by everyone".
-7. Follows edits, replies like "time changed 10:45 PM", and skips deals another admin already sent.
+7. Follows edits, replies like "time changed 10:45 PM", and skips deals another admin already sent to WhatsApp in the last 30 min.
+
+Understands: `Plan C - 10:35 PM @all`, `11:20 @all`, `9.15 @all`, `8:10 PM With Image @all`, `Free Post - 9:55 PM @all`,
+`Post ASAP @all` / `dalo @all` (instant), multi-deal messages (`Plan C - 4 Deals @all` + `9:40 PM ✅` lines → one job each, ids like `#9957-2`),
+deals without a time (waits for a reply with the time or "dalo"), and checks the @price so the same product at another price isn't accepted.
 
 Every result (success / fail with log) is sent to your **Saved Messages**.
 Control from Saved Messages: `/deal status`, `/deal pause`, `/deal resume`.
@@ -31,5 +35,6 @@ Control from Saved Messages: `/deal status`, `/deal pause`, `/deal resume`.
 | MAX_TRIES | 3 | tries before giving up |
 | WINDOW_AFTER_MIN | 60 | max gap between deal time and channel post |
 | MIN_SIMILARITY | 0.6 | how close the post text must be |
+| DUP_WINDOW_MIN | 30 | skip if someone else sent it within this many minutes |
 | ASK_APPROVAL | true | ask in Saved Messages before posting |
 | DRY_RUN | false | `true` = check only, never post in main group |

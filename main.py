@@ -55,9 +55,10 @@ PLAN_DEFAULTS = {  # command, channel count, group name
 SEARCH_DELAY_MIN = env("SEARCH_DELAY_MIN", 1, float)
 RETRY_GAP_MIN = env("RETRY_GAP_MIN", 5, float)
 MAX_TRIES = env("MAX_TRIES", 3, int)
-WINDOW_BEFORE_MIN = env("WINDOW_BEFORE_MIN", 20, int)   # post may come this early
+WINDOW_BEFORE_MIN = env("WINDOW_BEFORE_MIN", 15, int)   # post may come this early
 WINDOW_AFTER_MIN = env("WINDOW_AFTER_MIN", 60, int)     # "under 1 hour" rule
 MIN_SIMILARITY = env("MIN_SIMILARITY", 0.6, float)
+DUP_WINDOW_MIN = env("DUP_WINDOW_MIN", 30, int)         # someone else sent it within this time = skip
 BOT_REPLY_TIMEOUT = env("BOT_REPLY_TIMEOUT", 120, int)
 DRY_RUN = env("DRY_RUN", False, bool)                   # true = never post in main group
 ASK_APPROVAL = env("ASK_APPROVAL", True, bool)          # ask you in Saved Messages before posting
@@ -98,7 +99,7 @@ def save_state():
 
 
 def jkey(job):
-    return f"{job['chat']}:{job['msg_id']}"
+    return f"{job['chat']}:{job['msg_id']}:{job['idx']}"
 
 
 def now():
@@ -132,11 +133,18 @@ async def resolve(name_or_id):
 
 # ---------------------------------------------------------------- plan-group watching
 TIME_CHANGE_WORDS = re.compile(r"time|change|shift|delay|postpone|update|instead|new|now|reschedul", re.I)
+ACTIVE = ("pending", "waiting", "running")
 
 
-def make_job(chat_id, msg, sched):
-    return {"chat": chat_id, "msg_id": msg.id, "text": msg.message, "sched": sched, "attempt": 0,
-            "next_run": sched + timedelta(minutes=SEARCH_DELAY_MIN), "status": "pending", "log": []}
+def make_job(chat_id, msg, idx, n, deal):
+    job = {"chat": chat_id, "msg_id": msg.id, "idx": idx,
+           "id": str(msg.id) if n == 1 else f"{msg.id}-{idx + 1}",
+           "text": deal["text"], "price": deal["price"], "label": deal["label"],
+           "sched": None, "attempt": 0, "next_run": None, "status": "waiting", "log": [],
+           "created": msg.date.astimezone(IST)}
+    if deal["sched"]:
+        reschedule(job, deal["sched"])
+    return job
 
 
 def reschedule(job, sched):
@@ -144,6 +152,16 @@ def reschedule(job, sched):
     job["attempt"] = 0
     job["next_run"] = sched + timedelta(minutes=SEARCH_DELAY_MIN)
     job["status"] = "pending"
+
+
+def too_old(job):
+    last_try = job["next_run"] + timedelta(minutes=RETRY_GAP_MIN * (MAX_TRIES - 1) + 10)
+    return last_try < now()
+
+
+def describe(job):
+    when = fmt(job["next_run"]) if job["next_run"] else "⏳ waiting for a time"
+    return f"#{job['id']} → search {when}\n   words: {L.keyword_levels(job['text'])[0]}"
 
 
 async def is_bot_sender(msg):
@@ -154,77 +172,100 @@ async def is_bot_sender(msg):
         return False
 
 
+def msg_jobs(chat_id, msg_id):
+    return [j for k, j in sorted(jobs.items(), key=lambda kv: kv[0]) if k[0] == chat_id and k[1] == msg_id]
+
+
 async def handle_plan_msg(msg, chat_id, startup=False, edited=False):
     text = msg.message or ""
     if not text.strip() or await is_bot_sender(msg):
         return  # ignore empty + bots (Rose re-posts the deal with tags)
     plan = plans[chat_id]
+    P = f"Plan {plan['key']}"
     msg_dt = msg.date.astimezone(IST)
-    sched = L.parse_time(text, msg_dt)
-    sched_new = L.parse_time(text, msg_dt, last=True)  # "10:35 -> 10:45" means 10:45
+    deals = L.parse_deals(text, msg_dt)
     has_url = bool(L.URL_RE.search(text))
-    key = (chat_id, msg.id)
 
-    # 1) edit of a deal we already track
-    if key in jobs:
-        job = jobs[key]
-        if job["status"] in ("done", "failed"):
-            if edited and not startup:
-                await notify(f"✏️ Plan {plan['key']} deal was edited AFTER it was handled:\n\n{text}")
-            return
-        changed_time = sched and sched != job["sched"]
-        job["text"] = text
-        if changed_time:
-            reschedule(job, sched)
-        if not startup:
-            await notify(f"✏️ Plan {plan['key']} deal edited"
-                         + (f" – new time {fmt(sched)}" if changed_time else "") + f"\n\n{text}")
+    # 1) edit of a message we already track (time / deal changed)
+    existing = msg_jobs(chat_id, msg.id)
+    if existing:
+        changes = []
+        for i, d in enumerate(deals):
+            key = (chat_id, msg.id, i)
+            j = jobs.get(key)
+            if j is None:
+                jobs[key] = make_job(chat_id, msg, i, len(deals), d)
+                changes.append("new " + describe(jobs[key]))
+                continue
+            if j["status"] in ("done", "failed"):
+                continue
+            j["text"], j["price"], j["label"] = d["text"], d["price"], d["label"]
+            if d["sched"] and d["sched"] != j["sched"]:
+                reschedule(j, d["sched"])
+                changes.append("time changed " + describe(j))
+        if edited and not startup:
+            handled = [j for j in existing if j["status"] in ("done", "failed")]
+            note = (f"\n(already handled: {', '.join('#' + j['id'] for j in handled)})" if handled else "")
+            await notify(f"✏️ {P} message edited\n" + "\n".join(changes or ["text updated"]) + note + f"\n\n{text}")
         return
 
-    # 2) reply to a tracked deal: time change or updated deal
-    parent = jobs.get((chat_id, msg.reply_to_msg_id)) if msg.reply_to_msg_id else None
-    if parent and parent["status"] not in ("done", "failed"):
-        if has_url and L.deal_title(text):
-            parent["text"] = text
-        if sched_new:
-            reschedule(parent, sched_new)
-        if not startup:
-            await notify(f"🔁 Plan {plan['key']} update for deal #{parent['msg_id']}"
-                         f" → search at {fmt(parent['next_run'])}\n\n{text}")
+    # 2) a reply to a tracked deal message -> time for it / time change / "dalo" now
+    parents = [j for j in msg_jobs(chat_id, msg.reply_to_msg_id) if j["status"] in ACTIVE] \
+        if msg.reply_to_msg_id else []
+    if parents and not deals:
+        t = L.parse_time(text, msg_dt, last=True)
+        if not t and L.INSTANT_RE.search(text):
+            t = msg_dt
+        if t:
+            waiting = [j for j in parents if j["status"] == "waiting"]
+            targets = waiting or (parents if len(parents) == 1 else [])
+            if targets:
+                for j in targets:
+                    reschedule(j, t)
+                if not startup:
+                    await notify(f"🔁 {P} time from reply:\n" + "\n".join(describe(j) for j in targets)
+                                 + f"\n\nReply: {text}")
+            elif not startup:
+                await notify(f"⚠️ {P} reply with a time, but the message has {len(parents)} deals – "
+                             f"I can't tell which one. Please check:\n\n{text}")
         return
 
-    # 3) a brand-new deal
-    if has_url and sched:
-        if f"{chat_id}:{msg.id}" in done_keys:
-            return
-        job = make_job(chat_id, msg, sched)
-        last_try = job["next_run"] + timedelta(minutes=RETRY_GAP_MIN * (MAX_TRIES - 1) + 10)
-        if last_try < now():
-            return  # too old
-        if sched - msg_dt > timedelta(hours=20):
-            return
-        jobs[key] = job
-        lv = L.keyword_levels(text)
-        log.info("new job plan %s #%s at %s kw=%s", plan["key"], msg.id, fmt(sched), lv)
-        if not startup:
-            await notify(f"🆕 Plan {plan['key']} deal scheduled – search at {fmt(job['next_run'])}\n"
-                         f"Keywords: {lv[0]}\n\n{text}")
+    # 3) brand-new deal message (one or many deals)
+    if deals:
+        new = []
+        for i, d in enumerate(deals):
+            j = make_job(chat_id, msg, i, len(deals), d)
+            if jkey(j) in done_keys:
+                continue
+            if j["next_run"] and (too_old(j) or j["sched"] - msg_dt > timedelta(hours=20)):
+                continue
+            if not j["next_run"] and now() - msg_dt > timedelta(hours=6):
+                continue
+            jobs[(chat_id, msg.id, i)] = j
+            new.append(j)
+            log.info("new job %s #%s sched=%s kw=%s", P, j["id"], j["sched"], L.keyword_levels(j["text"]))
+        if new and not startup:
+            head = f"🆕 {P}: {len(new)} deal(s) found" if len(new) > 1 else f"🆕 {P} deal scheduled"
+            extra = ""
+            if any(j["status"] == "waiting" for j in new):
+                extra = "\n\n⏳ No time written – I'll wait for a reply with the time (or 'dalo'/'ASAP')."
+            await notify(head + "\n" + "\n".join(describe(j) for j in new) + extra)
         return
 
-    # 4) a plain "time changed" message (not a reply)
-    if sched and not has_url and TIME_CHANGE_WORDS.search(text) and not startup:
-        pending = [j for j in jobs.values() if j["chat"] == chat_id and j["status"] == "pending"]
-        if len(pending) == 1:
-            reschedule(pending[0], sched_new)
-            await notify(f"🔁 Plan {plan['key']} time change → deal #{pending[0]['msg_id']} "
-                         f"will be searched at {fmt(pending[0]['next_run'])}\n\n{text}")
-        else:
-            await notify(f"⚠️ Plan {plan['key']} time-change message, but I can't tell which deal it is "
-                         f"({len(pending)} pending). Please check:\n\n{text}")
-        return
-
-    if has_url and not sched and not startup:
-        await notify(f"⚠️ Plan {plan['key']} deal without a readable time – not scheduled:\n\n{text}")
+    # 4) a plain "time changed" / "dalo" message (not a reply, no link)
+    t = L.parse_time(text, msg_dt, last=True)
+    if not t and L.INSTANT_RE.search(text) and len(text.split()) <= 8:
+        t = msg_dt
+    if t and not has_url and not startup and (TIME_CHANGE_WORDS.search(text) or L.INSTANT_RE.search(text)):
+        active = [j for j in jobs.values() if j["chat"] == chat_id and j["status"] in ("pending", "waiting")]
+        waiting = [j for j in active if j["status"] == "waiting"]
+        target = waiting if len(waiting) == 1 else (active if len(active) == 1 else [])
+        if target:
+            reschedule(target[0], t)
+            await notify(f"🔁 {P} time update → {describe(target[0])}\n\n{text}")
+        elif active:
+            await notify(f"⚠️ {P} time message, but {len(active)} deals are open – I can't tell which. "
+                         f"Please check:\n\n{text}")
 
 
 # ---------------------------------------------------------------- bot search + verification
@@ -298,8 +339,9 @@ async def verify(job, plan, botmsg):
         checked += 1
         sim = L.similarity(job["text"], m.message or "")
         t_ok = L.in_window(m.date.astimezone(IST), sched, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN)
-        if sim < MIN_SIMILARITY or not t_ok:
-            bad.append(f"{link} → sim {sim:.0%}, posted {fmt(m.date)}")
+        p_ok = L.price_ok(job.get("price"), m.message or "")
+        if sim < MIN_SIMILARITY or not t_ok or not p_ok:
+            bad.append(f"{link} → sim {sim:.0%}, posted {fmt(m.date)}" + ("" if p_ok else ", DIFFERENT PRICE"))
     # b) OCR the screenshot the bot made (time + first line of every channel)
     ocr_n = 0
     if botmsg.photo:
@@ -320,6 +362,8 @@ async def verify(job, plan, botmsg):
                     bad.append(f"time {pdt.strftime('%I:%M %p')} too far: {r['text'][:50]}")
                 elif L.similarity(short_title, r["text"]) < MIN_SIMILARITY - 0.1:
                     bad.append(f"different deal?: {r['text'][:70]}")
+                elif not L.price_ok(job.get("price"), r["text"]):
+                    bad.append(f"different price (deal @{job.get('price')}): {r['text'][:70]}")
         except Exception as e:
             log.warning("OCR failed: %s", e)
     rep.append(f"{len(links)} links, {checked} opened, {ocr_n} rows read from screenshot")
@@ -331,10 +375,10 @@ async def verify(job, plan, botmsg):
 
 
 async def already_sent(job, plan, title_tokens):
-    """Someone else (other admin) already sent this deal from the main group?"""
-    since = job["sched"] - timedelta(minutes=WINDOW_BEFORE_MIN)
-    msgs = await client.get_messages(main_entity, limit=60)
-    by_id = {m.id: m for m in msgs}
+    """Did someone else already send this deal to WhatsApp from the main group in the last ~30 min?"""
+    since = now() - timedelta(minutes=DUP_WINDOW_MIN)
+    title = set(title_tokens)
+    msgs = await client.get_messages(main_entity, limit=80)
     for m in msgs:
         if m.date.astimezone(IST) < since:
             continue
@@ -342,12 +386,14 @@ async def already_sent(job, plan, title_tokens):
         if not t.lower().startswith(plan["cmd"] + " ") or m.out:
             continue
         kw = set(L.tokens(t[len(plan["cmd"]):]))
-        if not kw or not kw <= set(title_tokens):
+        if not kw or not kw <= title:
+            continue
+        if len(kw) < 2 and len(title) > 2:  # "/c Lifelong" alone is too vague to call it the same deal
             continue
         for r in msgs:
             if r.reply_to_msg_id == m.id and "sent to" in (r.message or "").lower():
                 s = await m.get_sender()
-                return getattr(s, "first_name", None) or "someone"
+                return f"{getattr(s, 'first_name', None) or 'someone'} ('{t}' at {fmt(m.date)})"
     return None
 
 
@@ -379,10 +425,11 @@ async def run_attempt(job):
         fresh = await client.get_messages(plan["entity"], ids=job["msg_id"])
         if fresh is None:
             job["status"] = "failed"
-            await notify(f"🗑 Plan {plan['key']} deal #{job['msg_id']} was deleted – skipped.")
+            await notify(f"🗑 Plan {plan['key']} deal #{job['id']} was deleted – skipped.")
             return
-        if fresh.message and fresh.message != job["text"]:
-            job["text"] = fresh.message
+        fd = L.parse_deals(fresh.message or "", fresh.date.astimezone(IST))
+        if job["idx"] < len(fd) and fd[job["idx"]]["text"] != job["text"]:
+            job["text"], job["price"] = fd[job["idx"]]["text"], fd[job["idx"]]["price"]
         levels = L.keyword_levels(job["text"])
         kw = levels[min(job["attempt"], len(levels) - 1)]
         cmd = f"{plan['cmd']} {kw}"
@@ -400,23 +447,29 @@ async def run_attempt(job):
                 return await finish(job, True, f"DRY RUN: would send '{cmd}' in main group now")
             if ASK_APPROVAL:
                 fut = asyncio.get_event_loop().create_future()
-                approvals[job["msg_id"]] = fut
-                await notify(f"❓ Plan {plan['key']} deal #{job['msg_id']} passed the test search.\n"
+                approvals[job["id"]] = fut
+                await notify(f"❓ Plan {plan['key']} deal #{job['id']} passed the test search.\n"
                              f"Send it to main group + WhatsApp with:  {cmd}\n\n"
-                             f"Reply here:  /deal ok {job['msg_id']}   or   /deal no {job['msg_id']}\n"
+                             f"Reply here:  /deal ok {job['id']}   or   /deal no {job['id']}\n"
                              f"(no answer in {APPROVAL_WAIT_MIN:g} min = skipped)\n\n"
                              + job["text"] + "\n\n" + "\n".join(rep))
                 try:
                     yes = await asyncio.wait_for(fut, APPROVAL_WAIT_MIN * 60)
                 except asyncio.TimeoutError:
                     yes = None
-                approvals.pop(job["msg_id"], None)
+                approvals.pop(job["id"], None)
                 if not yes:
                     return await finish(job, False, "skipped – " + ("you said no" if yes is False else "no approval reply"))
+                who = await already_sent(job, plan, L.tokens(L.deal_title(job["text"])))
+                if who:
+                    return await finish(job, True, f"already sent from main group by {who} – I didn't send again")
             _, res2 = await search(main_entity, cmd, in_group=True)
             ok2, rep2 = await verify(job, plan, res2)
             job["log"].append("Main group check:\n  " + "\n  ".join(rep2))
             if ok2:
+                who = await already_sent(job, plan, L.tokens(L.deal_title(job["text"])))
+                if who:
+                    return await finish(job, True, f"someone sent it meanwhile: {who} – I did NOT press WhatsApp")
                 pressed, info = await press_whatsapp(main_entity, res2)
                 if pressed:
                     return await finish(job, True, f"✅ {info}  (keywords: {kw})")
@@ -458,7 +511,10 @@ async def scheduler():
                         asyncio.create_task(run_attempt(job))
                 # forget finished jobs older than a day
                 for k, j in list(jobs.items()):
-                    if j["status"] in ("done", "failed") and j["sched"] < now() - timedelta(days=1):
+                    ref = j["sched"] or j["created"]
+                    if j["status"] in ("done", "failed") and ref < now() - timedelta(days=1):
+                        jobs.pop(k, None)
+                    elif j["status"] == "waiting" and j["created"] < now() - timedelta(hours=6):
                         jobs.pop(k, None)
         except Exception:
             log.exception("scheduler")
@@ -466,11 +522,12 @@ async def scheduler():
 
 
 def status_text():
-    act = [j for j in jobs.values() if j["status"] in ("pending", "running")]
+    act = [j for j in jobs.values() if j["status"] in ACTIVE]
     lines = [f"🤖 Deal bot {'PAUSED' if paused else 'running'} | plans {','.join(PLANS)} | dry_run={DRY_RUN} | ask_approval={ASK_APPROVAL}"]
-    for j in sorted(act, key=lambda j: j["next_run"]):
-        lines.append(f"• Plan {plans[j['chat']]['key']} #{j['msg_id']} try {j['attempt'] + 1} at "
-                     f"{fmt(j['next_run'])}: {L.deal_title(j['text'])[:50]}")
+    for j in sorted(act, key=lambda j: j["next_run"] or j["created"]):
+        when = fmt(j["next_run"]) if j["next_run"] else "waiting for time"
+        lines.append(f"• Plan {plans[j['chat']]['key']} #{j['id']} try {j['attempt'] + 1} – {when}: "
+                     f"{L.deal_title(j['text'])[:45]}")
     if not act:
         lines.append("No pending deals.")
     return "\n".join(lines)
@@ -508,9 +565,9 @@ async def main():
     async def on_cmd(event):
         global paused
         t = event.raw_text.lower()
-        m = re.search(r"\b(ok|yes|no|skip)\s+(\d+)", t)
-        if m and int(m.group(2)) in approvals:
-            fut = approvals[int(m.group(2))]
+        m = re.search(r"\b(ok|yes|no|skip)\s+#?([\d-]+)", t)
+        if m and m.group(2) in approvals:
+            fut = approvals[m.group(2)]
             if not fut.done():
                 fut.set_result(m.group(1) in ("ok", "yes"))
             await event.reply("👍 sending now" if m.group(1) in ("ok", "yes") else "⏭ skipped")
