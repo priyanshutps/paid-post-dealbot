@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 URL_RE = re.compile(r"https?://\S+|t\.me/\S+", re.I)
 TIME_RE = re.compile(r"(?<![\d@₹])(\d{1,2})\s*[:.]\s*(\d{2})\s*(am|pm|a\.m\.|p\.m\.)?(?!\d)", re.I)
+ASAP_RE = re.compile(r"\basap\b|post\s+now|right\s+now|immediately", re.I)
 STOP = {"grab", "loot", "deal", "deals", "offer", "buy", "now", "the", "a", "an", "of", "for",
         "and", "with", "at", "on", "in", "to", "@all", "all", "price", "only", "steal", "+",
         "coupon", "use", "apply", "max", "qnty", "qty", "single", "pc", "pcs"}
@@ -49,12 +50,16 @@ def parse_time(text, msg_dt, last=False):
             if cands:
                 found.append(min(cands))
     if not found:
+        if ASAP_RE.search(text):
+            return msg_dt  # "Post ASAP @all" = post right now
         return None
     return found[-1] if last else found[0]
 
 
 def is_header(line):
     l = line.lower()
+    if ASAP_RE.search(line) and ("@all" in line.lower() or len(line.split()) <= 4):
+        return True
     return bool(TIME_RE.search(URL_RE.sub(" ", line))) and ("@all" in l or "plan" in l or len(l.split()) <= 4) \
         or l.strip() in ("@all",)
 
@@ -70,8 +75,14 @@ def deal_title(text):
         if len(s2) < 3:
             continue
         lines.append(s2)
+    price = re.compile(r"@\s*[₹\d]")
     for s2 in lines:
-        if re.search(r"@\s*[₹\d]", s2):
+        if price.search(s2):
+            # "Loot For Needy | Lifelong Treadmill @5879" -> keep the part with the price
+            parts = [p.strip() for p in s2.split("|") if p.strip()]
+            for p in parts:
+                if price.search(p) and len(p.split("@")[0].strip()) >= 3:
+                    return p
             return s2
     return lines[0] if lines else ""
 
