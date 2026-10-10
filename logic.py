@@ -172,11 +172,24 @@ def parse_link(link):
     return None, None
 
 
-OCR_TIME = re.compile(r"(\d{1,2})[:.](\d{2})\s*([AaPp])\.?\s*[Mm]")
+OCR_TIME = re.compile(r"(?<!\d)(1[0-2]|0?[1-9])\s*[:.;]?\s*([0-5]\d)\s*([AaPp])\.?\s*[Mm]\b")  # "11:59 AM", OCR "1159 AM"
 OCR_DATE = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}\b|\b\d{1,2}/\d{1,2}(/\d{2,4})?\b")
 
 
 def ocr_rows(image_path):
+    """OCR with two page-layout modes and keep whichever finds more channel rows."""
+    best = []
+    for psm in ("11", "6"):
+        try:
+            rows = _ocr_rows(image_path, psm)
+        except Exception:
+            rows = []
+        if len([r for r in rows if r["time"]]) > len([r for r in best if r["time"]]):
+            best = rows
+    return best
+
+
+def _ocr_rows(image_path, psm="11"):
     """OCR the bot's screenshot into rows: [{'time': (h,m) or None, 'date': bool, 'text': str}]"""
     from PIL import Image, ImageOps
     import pytesseract
@@ -184,7 +197,7 @@ def ocr_rows(image_path):
     im = im.resize((im.width * 2, im.height * 2))
     if sum(im.getdata()) / (im.width * im.height) < 110:  # dark theme -> invert
         im = ImageOps.invert(im)
-    data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT, config="--psm 11")
+    data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT, config=f"--psm {psm}")
     words = []
     for i, w in enumerate(data["text"]):
         if w.strip():
@@ -309,3 +322,36 @@ def price_ok(price, text):
     if not found:
         return True
     return price in found
+
+
+def _fuzzy_in(word, have):
+    from difflib import SequenceMatcher
+    if word in have:
+        return True
+    for h in have:
+        if len(h) >= 3 and (h.startswith(word) or word.startswith(h)):
+            return True
+        if len(word) >= 4 and SequenceMatcher(None, word, h).ratio() >= 0.75:
+            return True
+    return False
+
+
+def snippet_matches(deal_text, row_text, need=0.5):
+    """Does the first line a channel posted (as read from the bot screenshot) belong to this deal?
+    Compares against the WHOLE deal text, because a post may start with a header line
+    ('Amazon Great Indian Festival | Top Vehicle Deals...') instead of the product name."""
+    t = OCR_TIME.search(row_text)
+    snippet = row_text[t.end():] if t else row_text            # drop channel name + time
+    snippet = re.split(r"\bV\w{1,3}w\s*p\w*", snippet, flags=re.I)[0]  # "View post" (also OCR "Virw pos")
+    snippet = re.sub(r"https?\S*|m\.\.\.", " ", snippet)
+    toks = tokens(snippet)[:9]                                  # one preview line is ~8 words
+    toks = toks[:-1] or toks                                    # last word may be cut ("A...")
+    toks = [x for x in toks if not re.fullmatch(r"\d{1,2}", x)]
+    if len(toks) < 2:
+        return True                                             # nothing readable -> don't block
+    have = set(tokens(deal_text))
+    toks = [x for x in toks if len(x) >= 3]                     # OCR junk like "pO", "e"
+    if len(toks) < 2:
+        return True
+    hit = sum(1 for x in toks if _fuzzy_in(x, have))
+    return hit / len(toks) >= need

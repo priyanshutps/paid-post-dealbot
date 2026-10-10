@@ -270,10 +270,11 @@ async def handle_plan_msg(msg, chat_id, startup=False, edited=False):
 
 # ---------------------------------------------------------------- bot search + verification
 def _final(m):
+    """A real result: the screenshot / links / 'Not posted' / 'no results'.
+    '⚠️ Error: Timed out' is NOT final – the bot usually sends the screenshot right after it."""
     t = (m.message or "").lower()
     return bool(m.photo or "t.me/" in t or "not posted" in t or "not found" in t
-                or "no result" in t or "no post" in t or "no match" in t or "unauthori" in t
-                or "error" in t or "timed out" in t)
+                or "no result" in t or "no post" in t or "no match" in t or "unauthori" in t)
 
 
 search_lock = asyncio.Lock()
@@ -292,13 +293,17 @@ async def _search(chat, cmd, in_group):
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(3)
         msgs = await client.get_messages(chat, limit=15, min_id=sent.id)
-        for m in reversed(msgs):
+        final = None
+        for m in reversed(msgs):  # oldest -> newest
             if m.sender_id != bot_id:
                 continue
             if in_group and m.reply_to_msg_id != sent.id:
                 continue
             found = m
-        if found and _final(found):
+            if _final(m):
+                final = m
+        if final:
+            found = final
             await asyncio.sleep(4)  # let the bot finish editing
             return sent, await client.get_messages(chat, ids=found.id)
     return sent, found
@@ -361,7 +366,7 @@ async def verify(job, plan, botmsg):
                 pdt = at_sched_day(sched, *r["time"])
                 if not L.in_window(pdt, sched, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN):
                     bad.append(f"time {pdt.strftime('%I:%M %p')} too far: {r['text'][:50]}")
-                elif L.similarity(short_title, r["text"]) < MIN_SIMILARITY - 0.1:
+                elif not L.snippet_matches(job["text"], r["text"]):
                     bad.append(f"different deal?: {r['text'][:70]}")
                 elif not L.price_ok(job.get("price"), r["text"]):
                     bad.append(f"different price (deal @{job.get('price')}): {r['text'][:70]}")
