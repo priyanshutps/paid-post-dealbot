@@ -40,8 +40,11 @@ def parse_time(text, msg_dt, last=False):
             h, m, ampm = int(mt.group(1)), int(mt.group(2)), mt.group(3)
             if h > 23 or m > 59:
                 continue
-            if mt.group(0).strip().count(".") and not ampm:
-                continue  # "1.50" is more likely a price than a time
+            if "." in mt.group(0) and not ampm:
+                # "9.15 @all" is a time, "@1.50" is a price: accept dot-times only on a header-like line
+                l = clean.lower()
+                if not ("@all" in l or "plan" in l or "time" in l or len(clean.split()) <= 3):
+                    continue
             cands = [c for c in _candidates(h, m, ampm, msg_dt) if c >= msg_dt - timedelta(minutes=30)]
             if cands:
                 found.append(min(cands))
@@ -57,7 +60,8 @@ def is_header(line):
 
 
 def deal_title(text):
-    """First real deal line (no header, no link)."""
+    """The product line: first non-header line with an @price, else the first real line."""
+    lines = []
     for line in text.split("\n"):
         s = line.strip()
         if not s or is_header(s):
@@ -65,8 +69,11 @@ def deal_title(text):
         s2 = URL_RE.sub("", s).strip()
         if len(s2) < 3:
             continue
-        return s2
-    return ""
+        lines.append(s2)
+    for s2 in lines:
+        if re.search(r"@\s*[₹\d]", s2):
+            return s2
+    return lines[0] if lines else ""
 
 
 def _clean(s):
