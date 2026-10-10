@@ -3,7 +3,8 @@ import re
 from datetime import datetime, timedelta
 
 URL_RE = re.compile(r"https?://\S+|t\.me/\S+", re.I)
-TIME_RE = re.compile(r"(?<![\d@₹])(\d{1,2})\s*[:.]\s*(\d{2})\s*(am|pm|a\.m\.|p\.m\.)?(?!\d)", re.I)
+# "10:35 PM", "9.15", "11:20", and also "12 PM" / "11am" (no minutes, only when AM/PM is written)
+TIME_RE = re.compile(r"(?<![\d@₹,.])(\d{1,2})(?:\s*[:.]\s*(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?(?![\d])(?![a-z])", re.I)
 ASAP_RE = re.compile(r"\basap\b|post\s+now|right\s+now|immediately", re.I)
 STOP = {"grab", "loot", "deal", "deals", "offer", "buy", "now", "the", "a", "an", "of", "for",
         "and", "with", "at", "on", "in", "to", "@all", "all", "price", "only", "steal", "+",
@@ -38,7 +39,9 @@ def parse_time(text, msg_dt, last=False):
     for line in order:
         clean = URL_RE.sub(" ", line)
         for mt in TIME_RE.finditer(clean):
-            h, m, ampm = int(mt.group(1)), int(mt.group(2)), mt.group(3)
+            if mt.group(2) is None and not mt.group(3):
+                continue  # a bare number like "3" is not a time
+            h, m, ampm = int(mt.group(1)), int(mt.group(2) or 0), mt.group(3)
             if h > 23 or m > 59:
                 continue
             if "." in mt.group(0) and not ampm:
@@ -60,7 +63,7 @@ def is_header(line):
     l = line.lower()
     if ASAP_RE.search(line) and ("@all" in line.lower() or len(line.split()) <= 4):
         return True
-    return bool(TIME_RE.search(URL_RE.sub(" ", line))) and ("@all" in l or "plan" in l or len(l.split()) <= 4) \
+    return bool(_time_in(line)) and ("@all" in l or "plan" in l or len(l.split()) <= 4) \
         or l.strip() in ("@all",)
 
 
@@ -224,7 +227,9 @@ def _time_in(line):
     """(hour, minute, ampm) of the first time in a line, or None."""
     clean = URL_RE.sub(" ", line)
     for mt in TIME_RE.finditer(clean):
-        h, m, ampm = int(mt.group(1)), int(mt.group(2)), mt.group(3)
+        if mt.group(2) is None and not mt.group(3):
+            continue  # a bare number like "3" is not a time
+        h, m, ampm = int(mt.group(1)), int(mt.group(2) or 0), mt.group(3)
         if h > 23 or m > 59:
             continue
         if PRICE_RE.search(clean[max(0, mt.start() - 3):mt.end()]):
