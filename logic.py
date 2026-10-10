@@ -29,7 +29,7 @@ def _candidates(h, m, ampm, ref):
 def parse_time(text, msg_dt, last=False):
     """Return the scheduled datetime written in the message (or None).
     msg_dt = when the message was posted (tz-aware, IST)."""
-    head = text.split("\n")
+    head = text.splitlines()
     # prefer a time on a line that has no link / price (the header line)
     lines = [l for l in head if l.strip()]
     order = [l for l in lines if not URL_RE.search(l)] + [l for l in lines if URL_RE.search(l)]
@@ -62,7 +62,7 @@ def is_header(line):
 def deal_title(text):
     """The product line: first non-header line with an @price, else the first real line."""
     lines = []
-    for line in text.split("\n"):
+    for line in text.splitlines():
         s = line.strip()
         if not s or is_header(s):
             continue
