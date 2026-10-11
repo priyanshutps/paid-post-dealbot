@@ -58,11 +58,13 @@ MAX_TRIES = env("MAX_TRIES", 3, int)
 WINDOW_BEFORE_MIN = env("WINDOW_BEFORE_MIN", 15, int)   # post may come this early
 WINDOW_AFTER_MIN = env("WINDOW_AFTER_MIN", 60, int)     # "under 1 hour" rule
 MIN_SIMILARITY = env("MIN_SIMILARITY", 0.6, float)
-DUP_WINDOW_MIN = env("DUP_WINDOW_MIN", 30, int)         # someone else sent it within this time = skip
+DUP_WINDOW_MIN = env("DUP_WINDOW_MIN", 10, int)         # already sent within ±10 min of the deal time = skip
 BOT_REPLY_TIMEOUT = env("BOT_REPLY_TIMEOUT", 120, int)
 DRY_RUN = env("DRY_RUN", False, bool)                   # true = never post in main group
 ASK_APPROVAL = env("ASK_APPROVAL", True, bool)          # ask you in Saved Messages before posting
-APPROVAL_WAIT_MIN = env("APPROVAL_WAIT_MIN", 15, float) # no answer in this time = skip
+APPROVAL_WAIT_MIN = env("APPROVAL_WAIT_MIN", 15, float)
+FAIL_NOTIFY = [u.strip().lstrip("@").replace("https://t.me/", "").replace("t.me/", "")
+               for u in env("FAIL_NOTIFY", "shivamloot123,turboloot123").split(",") if u.strip()] # no answer in this time = skip
 approvals = {}  # msg_id -> asyncio.Future
 NOTIFY_SUCCESS = env("NOTIFY_SUCCESS", True, bool)
 STATE_FILE = env("STATE_FILE", "/data/state.json" if os.path.isdir("/data") else "state.json")
@@ -350,7 +352,7 @@ async def verify(job, plan, botmsg):
             bad.append(f"{link} → sim {sim:.0%}, posted {fmt(m.date)}" + ("" if p_ok else ", DIFFERENT PRICE"))
     # b) OCR the screenshot the bot made (time + first line of every channel)
     ocr_n = 0
-    if botmsg.photo:
+    if botmsg.photo and checked < len(links):  # all posts opened & checked -> screenshot not needed
         try:
             with tempfile.TemporaryDirectory() as d:
                 path = await client.download_media(botmsg, file=os.path.join(d, "r.jpg"))
@@ -375,6 +377,8 @@ async def verify(job, plan, botmsg):
     rep.append(f"{len(links)} links, {checked} opened, {ocr_n} rows read from screenshot")
     if bad:
         return False, rep + bad
+    if checked and checked == len(links):
+        rep.append("all posts opened and matched – screenshot check skipped")
     if checked == 0 and ocr_n == 0:
         rep.append("⚠️ could not open posts or read screenshot – passed on bot result only")
     return True, rep
@@ -382,11 +386,12 @@ async def verify(job, plan, botmsg):
 
 async def already_sent(job, plan, title_tokens):
     """Did someone else already send this deal to WhatsApp from the main group in the last ~30 min?"""
-    since = now() - timedelta(minutes=DUP_WINDOW_MIN)
+    lo = job["sched"] - timedelta(minutes=DUP_WINDOW_MIN)
+    hi = job["sched"] + timedelta(minutes=DUP_WINDOW_MIN)
     title = set(title_tokens)
     msgs = await client.get_messages(main_entity, limit=80)
     for m in msgs:
-        if m.date.astimezone(IST) < since:
+        if not (lo <= m.date.astimezone(IST) <= hi):
             continue
         t = (m.message or "").strip()
         if not t.lower().startswith(plan["cmd"] + " "):  # includes our own earlier sends (restart safety)
@@ -506,6 +511,19 @@ async def finish(job, success, summary):
         return
     head = ("✅ " if success else "❌ ") + f"Plan {plan['key']} – {fmt(job['sched'])} – {summary}"
     await notify(head + "\n\n" + job["text"] + "\n\n— log —\n" + "\n".join(job["log"]))
+    if not success:
+        reason = ""
+        for line in reversed(job["log"]):
+            bad = [x.strip() for x in line.splitlines()[1:] if x.strip() and "links," not in x]
+            if bad:
+                reason = "\nReason: " + bad[0][:200]
+                break
+        alert = (f"❌ NOT POSTED – Plan {plan['key']} deal ({fmt(job['sched'])})\n{summary}{reason}\n\n{job['text']}")
+        for u in FAIL_NOTIFY:
+            try:
+                await client.send_message(u, alert[:4000], parse_mode=None, link_preview=False)
+            except Exception as e:
+                log.warning("fail alert to %s failed: %s", u, e)
 
 
 # ---------------------------------------------------------------- loop + control

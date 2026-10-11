@@ -343,7 +343,7 @@ def snippet_matches(deal_text, row_text, need=0.5):
     t = OCR_TIME.search(row_text)
     snippet = row_text[t.end():] if t else row_text            # drop channel name + time
     snippet = re.split(r"\bV\w{1,3}w\s*p\w*", snippet, flags=re.I)[0]  # "View post" (also OCR "Virw pos")
-    snippet = re.sub(r"https?\S*|m\.\.\.", " ", snippet)
+    snippet = re.sub(r"\S*(https?:|://|www\.|\.(cc|in|to|it|com|co|me|ly|link|org)\b|/)\S*", " ", snippet, flags=re.I)  # links
     toks = tokens(snippet)[:9]                                  # one preview line is ~8 words
     toks = toks[:-1] or toks                                    # last word may be cut ("A...")
     toks = [x for x in toks if not re.fullmatch(r"\d{1,2}", x)]
@@ -351,7 +351,7 @@ def snippet_matches(deal_text, row_text, need=0.5):
         return True                                             # nothing readable -> don't block
     have = set(tokens(deal_text))
     toks = [x for x in toks if len(x) >= 3]                     # OCR junk like "pO", "e"
-    if len(toks) < 2:
-        return True
+    if len(toks) < 3:
+        return True                                             # too little readable text to judge
     hit = sum(1 for x in toks if _fuzzy_in(x, have))
     return hit / len(toks) >= need
