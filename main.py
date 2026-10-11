@@ -492,6 +492,11 @@ async def run_attempt(job):
             return await finish(job, False, "Not posted by everyone")
         job["next_run"] = now() + timedelta(minutes=RETRY_GAP_MIN)
         job["status"] = "pending"
+        if job["attempt"] == MAX_TRIES - 1:  # 2nd try failed -> early warning
+            head = (f"⚠️ NOT POSTED YET – failed try {job['attempt']} of {MAX_TRIES}. "
+                    f"Last try at {job['next_run'].strftime('%I:%M %p')}")
+            await notify(head + f"\nPlan {plan['key']} #{job['id']}\nReason: {last_reason(job)}\n\n{job['text']}")
+            await alert_people(job, head)
     except Exception as e:
         log.exception("attempt crashed")
         job["attempt"] += 1
@@ -512,18 +517,28 @@ async def finish(job, success, summary):
     head = ("✅ " if success else "❌ ") + f"Plan {plan['key']} – {fmt(job['sched'])} – {summary}"
     await notify(head + "\n\n" + job["text"] + "\n\n— log —\n" + "\n".join(job["log"]))
     if not success:
-        reason = ""
-        for line in reversed(job["log"]):
-            bad = [x.strip() for x in line.splitlines()[1:] if x.strip() and "links," not in x]
-            if bad:
-                reason = "\nReason: " + bad[0][:200]
-                break
-        alert = (f"❌ NOT POSTED – Plan {plan['key']} deal ({fmt(job['sched'])})\n{summary}{reason}\n\n{job['text']}")
-        for u in FAIL_NOTIFY:
-            try:
-                await client.send_message(u, alert[:4000], parse_mode=None, link_preview=False)
-            except Exception as e:
-                log.warning("fail alert to %s failed: %s", u, e)
+        await alert_people(job, f"❌ NOT POSTED (final, after try {job['attempt']}) – {summary}")
+
+
+def last_reason(job):
+    for line in reversed(job["log"]):
+        bad = [x.strip() for x in line.splitlines()[1:] if x.strip() and "links," not in x]
+        if bad:
+            return bad[0][:200]
+    return ""
+
+
+async def alert_people(job, head):
+    """Alert @shivamloot123 / @turboloot123 (FAIL_NOTIFY) about a deal that is not posted."""
+    plan = plans[job["chat"]]
+    reason = last_reason(job)
+    alert = (f"{head}\nPlan {plan['key']} deal ({fmt(job['sched'])}) #{job['id']}"
+             + (f"\nReason: {reason}" if reason else "") + f"\n\n{job['text']}")
+    for u in FAIL_NOTIFY:
+        try:
+            await client.send_message(u, alert[:4000], parse_mode=None, link_preview=False)
+        except Exception as e:
+            log.warning("fail alert to %s failed: %s", u, e)
 
 
 # ---------------------------------------------------------------- loop + control
