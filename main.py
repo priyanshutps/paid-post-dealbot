@@ -63,6 +63,8 @@ BOT_REPLY_TIMEOUT = env("BOT_REPLY_TIMEOUT", 120, int)
 DRY_RUN = env("DRY_RUN", False, bool)                   # true = never post in main group
 ASK_APPROVAL = env("ASK_APPROVAL", True, bool)          # ask you in Saved Messages before posting
 APPROVAL_WAIT_MIN = env("APPROVAL_WAIT_MIN", 15, float)
+CALL_USER = env("CALL_USER", "turboloot123").strip().lstrip("@").replace("https://t.me/", "")
+CALL_SECONDS = env("CALL_SECONDS", 10, int)             # ring this long, then hang up (missed call)
 FAIL_NOTIFY = [u.strip().lstrip("@").replace("https://t.me/", "").replace("t.me/", "")
                for u in env("FAIL_NOTIFY", "shivamloot123,turboloot123").split(",") if u.strip()] # no answer in this time = skip
 approvals = {}  # msg_id -> asyncio.Future
@@ -497,6 +499,7 @@ async def run_attempt(job):
                     f"Last try at {job['next_run'].strftime('%I:%M %p')}")
             await notify(head + f"\nPlan {plan['key']} #{job['id']}\nReason: {last_reason(job)}\n\n{job['text']}")
             await alert_people(job, head)
+            asyncio.create_task(missed_call(CALL_USER))  # 10-second missed call to @turboloot123
     except Exception as e:
         log.exception("attempt crashed")
         job["attempt"] += 1
@@ -518,6 +521,40 @@ async def finish(job, success, summary):
     await notify(head + "\n\n" + job["text"] + "\n\n— log —\n" + "\n".join(job["log"]))
     if not success:
         await alert_people(job, f"❌ NOT POSTED (final, after try {job['attempt']}) – {summary}")
+
+
+async def missed_call(username, seconds=CALL_SECONDS):
+    """Ring a Telegram user for a few seconds and hang up, so they get a missed call."""
+    if not username:
+        return
+    import hashlib, secrets, random
+    from telethon.tl.functions.messages import GetDhConfigRequest
+    from telethon.tl.functions.phone import RequestCallRequest, DiscardCallRequest
+    from telethon.tl.types import PhoneCallProtocol, InputPhoneCall, PhoneCallDiscardReasonMissed
+    call = None
+    try:
+        user = await client.get_input_entity(username)
+        dh = await client(GetDhConfigRequest(version=0, random_length=256))
+        p = int.from_bytes(dh.p, "big")
+        a = int.from_bytes(secrets.token_bytes(256), "big") % (p - 1)
+        g_a = pow(dh.g, a, p).to_bytes(256, "big")
+        res = await client(RequestCallRequest(
+            user_id=user, random_id=random.randint(0, 2**31 - 1),
+            g_a_hash=hashlib.sha256(g_a).digest(),
+            protocol=PhoneCallProtocol(min_layer=65, max_layer=92, udp_p2p=True, udp_reflector=True,
+                                       library_versions=["2.4.4", "3.0.0", "4.0.0"])))
+        call = res.phone_call
+        log.info("ringing %s for %ss", username, seconds)
+        await asyncio.sleep(seconds)
+    except Exception as e:
+        log.warning("missed call to %s failed: %s", username, e)
+    finally:
+        if call is not None:
+            try:
+                await client(DiscardCallRequest(peer=InputPhoneCall(id=call.id, access_hash=call.access_hash),
+                                                duration=0, reason=PhoneCallDiscardReasonMissed(), connection_id=0))
+            except Exception as e:
+                log.info("hang up: %s", e)
 
 
 def last_reason(job):
